@@ -11,7 +11,7 @@ module Railgun
   class Mailer
 
     # List of the headers that will be ignored when copying headers from `mail.header_fields`
-    IGNORED_HEADERS = %w[ to from subject ]
+    IGNORED_HEADERS = %w[ to from subject reply-to ]
 
     # [Hash] config ->
     #   Requires *at least* `api_key` and `domain` keys.
@@ -90,7 +90,12 @@ module Railgun
     end
 
     mail.header_fields.each do |field|
-      msg_headers[field.name] = field.value
+      header = field.name.downcase
+      if msg_headers.include? header
+        msg_headers[header] = [msg_headers[header], field.value].flatten
+      else
+        msg_headers[header] = field.value
+      end
     end
 
     msg_headers.each do |k, v|
