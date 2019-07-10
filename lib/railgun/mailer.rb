@@ -1,4 +1,5 @@
 require 'action_mailer'
+require 'json'
 require 'mailgun'
 require 'rails'
 require 'railgun/errors'
@@ -8,6 +9,9 @@ module Railgun
   # Railgun::Mailer is an ActionMailer provider for sending mail through
   # Mailgun.
   class Mailer
+
+    # List of the headers that will be ignored when copying headers from `mail.header_fields`
+    IGNORED_HEADERS = %w[ to from subject ]
 
     # [Hash] config ->
     #   Requires *at least* `api_key` and `domain` keys.
@@ -23,7 +27,7 @@ module Railgun
         raise Railgun::ConfigurationError.new("Config requires `#{k}` key", @config) unless @config.has_key?(k)
       end
 
-      @mg_client = Mailgun::Client.new(config[:api_key])
+      @mg_client = Mailgun::Client.new(config[:api_key], config[:api_host] || 'api.mailgun.net', config[:api_version] || 'v3', config[:api_ssl].nil? ? true : config[:api_ssl])
       @domain = @config[:domain]
 
       # To avoid exception in mail gem v2.6
@@ -47,7 +51,7 @@ module Railgun
     end
 
     def mailgun_client
-      @mg_obj
+      @mg_client
     end
 
   end
@@ -66,7 +70,7 @@ module Railgun
 
     # v:* attributes (variables)
     mail.mailgun_variables.try(:each) do |k, v|
-      message["v:#{k}"] = v
+      message["v:#{k}"] = JSON.dump(v)
     end
 
     # o:* attributes (options)
@@ -74,8 +78,36 @@ module Railgun
       message["o:#{k}"] = v
     end
 
+    # support for using ActionMailer's `headers()` inside of the mailer
+    # note: this will filter out parameters such as `from`, `to`, and so forth
+    #       as they are accepted as POST parameters on the message endpoint.
+
+    msg_headers = Hash.new
+
     # h:* attributes (headers)
     mail.mailgun_headers.try(:each) do |k, v|
+      msg_headers[k] = v
+    end
+
+    mail.header_fields.each do |field|
+      msg_headers[field.name] = field.value
+    end
+
+    msg_headers.each do |k, v|
+      if Railgun::Mailer::IGNORED_HEADERS.include? k.downcase
+        Rails.logger.debug("[railgun] ignoring header (using envelope instead): #{k}")
+        next
+      end
+
+      # Cover cases like `cc`, `bcc` where parameters are valid
+      # headers BUT they are submitted as separate POST params
+      # and already exist on the message because of the call to
+      # `build_message_object`.
+      if message.include? k.downcase
+        Rails.logger.debug("[railgun] ignoring header (already set): #{k}")
+        next
+      end
+
       message["h:#{k}"] = v
     end
 
@@ -84,7 +116,12 @@ module Railgun
 
     # reject blank values
     message.delete_if do |k, v|
-      v.nil? or (v.respond_to?(:empty) and v.empty?)
+      return true if v.nil?
+
+      # if it's an array remove empty elements
+      v.delete_if { |i| i.respond_to?(:empty?) && i.empty? } if v.is_a?(Array)
+
+      v.respond_to?(:empty?) && v.empty?
     end
 
     return message
@@ -138,7 +175,7 @@ module Railgun
   # @return [String]
   def extract_body_html(mail)
     begin
-      (mail.html_part || mail).body.decoded || nil
+      retrieve_html_part(mail).body.decoded || nil
     rescue
       nil
     end
@@ -152,10 +189,34 @@ module Railgun
   # @return [String]
   def extract_body_text(mail)
     begin
-      (mail.text_part || mail).body.decoded || nil
+      retrieve_text_part(mail).body.decoded || nil
     rescue
       nil
     end
+  end
+
+  # Returns the mail object from the Mail::Message object if text part exists,
+  # (decomposing multipart into individual format if necessary)
+  # otherwise nil.
+  #
+  # @param [Mail::Message] mail message to transform
+  #
+  # @return [Mail::Message] mail message with its content-type = text/plain
+  def retrieve_text_part(mail)
+    return mail.text_part if mail.multipart?
+    (mail.mime_type =~ /^text\/plain$/i) && mail
+  end
+
+  # Returns the mail object from the Mail::Message object if html part exists,
+  # (decomposing multipart into individual format if necessary)
+  # otherwise nil.
+  #
+  # @param [Mail::Message] mail message to transform
+  #
+  # @return [Mail::Message] mail message with its content-type = text/html
+  def retrieve_html_part(mail)
+    return mail.html_part if mail.multipart?
+    (mail.mime_type =~ /^text\/html$/i) && mail
   end
 
 end
